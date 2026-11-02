@@ -25,6 +25,9 @@ use serde::{Deserialize, Serialize};
 use strum::{Display, EnumDiscriminants, EnumString, IntoDiscriminant, IntoEnumIterator};
 use web_time::{Duration, Instant};
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+
 fn color_format_display_name(format: ColorFormat) -> &'static str {
     match format {
         ColorFormat::Hex => "HEX",
@@ -496,6 +499,18 @@ pub struct App {
     show_help: bool,
     focus_something: bool,
     focus_dir: Option<FocusDirection>,
+    active_tab: AppTab,
+    favorites: Vec<[f32; 4]>,
+    screen_picker_status: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    screen_picker_receiver: Option<Receiver<Result<Color, String>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AppTab {
+    #[default]
+    Picker,
+    Saved,
 }
 
 impl App {
@@ -516,7 +531,7 @@ impl App {
 
         log_startup::log("Gl programs created");
 
-        let AppData { mode } = Self::load(cc.storage);
+        let AppData { mode, favorites } = Self::load(cc.storage);
 
         Self {
             colors: CurrentColors::new(mode, data.0),
@@ -538,6 +553,11 @@ impl App {
             show_help: false,
             focus_something: false,
             focus_dir: None,
+            active_tab: AppTab::Picker,
+            favorites,
+            screen_picker_status: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            screen_picker_receiver: None,
         }
     }
 
@@ -581,6 +601,145 @@ impl App {
             is_prev_fallback,
             cur_egui: fallback_egui_color,
         };
+    }
+
+    fn select_color(&mut self, color: LinearRgba) {
+        self.colors.assign(Color::from(color), true);
+        self.colors.assign(Color::from(color), false);
+        self.input_text.clear();
+    }
+
+    fn favorite_current_color(&mut self) {
+        let color = self.fallbacks.cur.to_f32_array();
+        if !self.is_favorite(color) {
+            self.favorites.push(color);
+        }
+    }
+
+    fn is_favorite(&self, color: [f32; 4]) -> bool {
+        self.favorites.iter().any(|saved| {
+            saved
+                .iter()
+                .zip(color)
+                .all(|(a, b)| (*a - b).abs() < 0.0001)
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_screen_picker(&mut self, ctx: &egui::Context) {
+        if self.screen_picker_receiver.is_some() {
+            return;
+        }
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            self.screen_picker_status =
+                Some("Screen picking requires a Wayland session.".to_owned());
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let repaint = ctx.clone();
+        self.screen_picker_receiver = Some(receiver);
+        self.screen_picker_status = Some("Pick a pixel on the screen…".to_owned());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+
+        std::thread::spawn(move || {
+            let result = std::process::Command::new("hyprpicker")
+                .args(["--format", "hex"])
+                .output()
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        "hyprpicker was not found. Install it and try again.".to_owned()
+                    } else {
+                        format!("Could not start hyprpicker: {error}")
+                    }
+                })
+                .and_then(|output| {
+                    if !output.status.success() {
+                        return Err("Screen picking was cancelled or hyprpicker failed.".to_owned());
+                    }
+                    let value = String::from_utf8_lossy(&output.stdout);
+                    let value = value.trim();
+                    crate::formats::parse_color_unknown_format(value)
+                        .map(|(color, _, _)| color)
+                        .ok_or_else(|| format!("Unrecognized hyprpicker output: {value}"))
+                });
+            let _ = sender.send(result);
+            repaint.request_repaint();
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_screen_picker(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.screen_picker_receiver.as_ref() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.screen_picker_receiver = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                match result {
+                    Ok(color) => {
+                        self.select_color(color.into());
+                        self.screen_picker_status = Some("Screen color selected.".to_owned());
+                    }
+                    Err(error) => self.screen_picker_status = Some(error),
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.screen_picker_receiver = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                self.screen_picker_status =
+                    Some("The screen picker stopped unexpectedly.".to_owned());
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn update_saved_colors(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Favorite colors");
+        ui.label("Click a color to load it back into the picker.");
+        ui.add_space(12.0);
+
+        if self.favorites.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No favorite colors yet. Save one from the Picker tab.");
+            });
+            return;
+        }
+
+        let mut remove = None;
+        let favorites = self.favorites.clone();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (index, rgba) in favorites.into_iter().enumerate() {
+                let color = LinearRgba::new(rgba[0], rgba[1], rgba[2], rgba[3]);
+                let [r, g, b, a] = Srgba::from(color).to_u8_array();
+                ui.horizontal(|ui| {
+                    let swatch = ui.add_sized(
+                        [52.0, 36.0],
+                        Button::new("").fill(Color32::from_rgba_unmultiplied(r, g, b, a)),
+                    );
+                    if swatch.clicked() {
+                        self.select_color(color);
+                        self.active_tab = AppTab::Picker;
+                    }
+                    let label = format_color(color, self.format, self.use_alpha);
+                    if ui.button(&label).clicked() {
+                        self.select_color(color);
+                        self.active_tab = AppTab::Picker;
+                    }
+                    if ui.button("Copy").clicked() {
+                        ui.ctx().copy_text(label);
+                    }
+                    if ui.button("Remove").clicked() {
+                        remove = Some(index);
+                    }
+                });
+                ui.add_space(5.0);
+            }
+        });
+        if let Some(index) = remove {
+            self.favorites.remove(index);
+        }
     }
 
     fn glow_paint(&self, ui: &mut egui::Ui, program: ProgramKind, size: Vec2) {
@@ -929,9 +1088,19 @@ impl App {
         style.spacing.button_padding = egui::vec2(4.0, 3.0);
 
         ui.horizontal(|ui| {
+            let icon_button_size = ui.spacing().interact_size.y.clamp(28.0, 34.0);
+            let icon_count = if cfg!(target_arch = "wasm32") {
+                2.0
+            } else {
+                3.0
+            };
+            let reserved_width =
+                icon_button_size * icon_count + ui.spacing().item_spacing.x * icon_count;
+            let format_width = (ui.available_width() - reserved_width).clamp(60.0, 190.0);
+
             self.format_dropdown =
             egui::ComboBox::from_id_salt("format")
-                .width(ui.available_width().min(190.))
+                .width(format_width)
                 .truncate()
                 .selected_text(color_format_display_name(self.format))
                 .height(500.)
@@ -950,9 +1119,44 @@ impl App {
                 }).response.id;
 
             ui.style_mut().spacing.button_padding = egui::vec2(6.0, 6.0);
+            let current_is_favorite = self.is_favorite(self.fallbacks.cur.to_f32_array());
+            let favorite_icon = if current_is_favorite {
+                egui::include_image!("favorite-filled.svg")
+            } else {
+                egui::include_image!("favorite.svg")
+            };
+            let save = ui
+                .add(
+                    Button::image(favorite_icon)
+                        .min_size(Vec2::splat(icon_button_size)),
+                )
+                .on_hover_text(if current_is_favorite {
+                    "This color is already in favorites"
+                } else {
+                    "Save color to favorites"
+                });
+            if save.clicked() {
+                self.favorite_current_color();
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let running = self.screen_picker_receiver.is_some();
+                let pick = ui
+                    .add_enabled(
+                        !running,
+                        Button::image(egui::include_image!("eyedropper.svg"))
+                            .min_size(Vec2::splat(icon_button_size)),
+                    )
+                    .on_hover_text("Pick a color from the screen");
+                if pick.clicked() {
+                    self.start_screen_picker(ui.ctx());
+                }
+            }
+
             let response = ui.add(
                 egui::Button::new(egui::include_image!("help.svg"))
-                     .min_size(Vec2::new(ui.available_height(), ui.available_height())),
+                     .min_size(Vec2::splat(icon_button_size)),
             ).on_hover_text("Help");
             if response.clicked() {
                 self.show_help = !self.show_help;
@@ -993,7 +1197,7 @@ impl App {
                         ("d", "Done (print result to console)"),
                         ("←/↓/↑/→", "Move focus or control input"),
                         ("h/j/k/l", "Move focus or control input (Vim style)"),
-                        ("F1/F2", "Switch color model tabs"),
+                        ("F1/F2/F3", "Switch color model or favorites tabs"),
                         ("1/2", "Switch focus to pickers"),
                         ("3/4/5/6", "Switch focus to sliders"),
                         ("Tab/S-Tab", "Cycle focus"),
@@ -1042,6 +1246,9 @@ impl App {
                 self.show_help = false;
             }
         });
+        if let Some(status) = self.screen_picker_status.as_deref() {
+            ui.label(RichText::new(status).small().weak());
+        }
         if self.format.needs_explicit_alpha() {
             ui.add_space(2.);
             if ui
@@ -1160,12 +1367,14 @@ impl App {
 #[serde(default)]
 struct AppData {
     mode: CurrentColorsDiscriminants,
+    favorites: Vec<[f32; 4]>,
 }
 
 impl Default for AppData {
     fn default() -> Self {
         Self {
             mode: CurrentColorsDiscriminants::Oklrch,
+            favorites: Vec::new(),
         }
     }
 }
@@ -1276,7 +1485,9 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
-        let ctx = ui.ctx();
+        let ctx = ui.ctx().clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_screen_picker(&ctx);
         if self.first_frame {
             log_startup::log("First frame start");
             self.first_frame = false;
@@ -1295,40 +1506,55 @@ impl eframe::App for App {
         self.calculate_fallbacks();
 
         central_panel.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.allocate_space(Vec2::new(8., 0.));
+                ui.style_mut().visuals.selection.bg_fill = Color32::from_gray(50);
+                ui.style_mut().visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
+                ui.style_mut().visuals.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+                ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                ui.style_mut().spacing.button_padding = egui::vec2(16.0, 3.0);
+
+                for (d, label, hotkey) in [
+                    (CurrentColorsDiscriminants::Oklrch, "OKLrCH", Key::F1),
+                    (CurrentColorsDiscriminants::Okhsv, "OKHSV", Key::F2),
+                ] {
+                    let selected =
+                        self.active_tab == AppTab::Picker && self.colors.discriminant() == d;
+                    let clicked = Button::selectable(selected, make_label(ui, label, Some(18.0)))
+                        .frame_when_inactive(true)
+                        .ui(ui)
+                        .clicked();
+                    if clicked || self.hotkey(ui, hotkey) {
+                        self.active_tab = AppTab::Picker;
+                        self.colors.convert(d);
+                    }
+                }
+
+                let favorite_clicked = Button::selectable(
+                    self.active_tab == AppTab::Saved,
+                    RichText::new("Favorite").size(18.0),
+                )
+                .frame_when_inactive(true)
+                .ui(ui)
+                .clicked();
+                if favorite_clicked || self.hotkey(ui, Key::F3) {
+                    self.active_tab = AppTab::Saved;
+                }
+            });
+            ui.add_space(6.0);
+
+            if self.active_tab == AppTab::Saved {
+                self.update_saved_colors(ui);
+                return;
+            }
+
             StripBuilder::new(ui)
-                .size(Size::exact(30.))
                 .size(Size::remainder())
                 .size(Size::relative(0.01))
                 .size(Size::relative(0.20).at_least(120.))
                 .size(Size::relative(0.01))
                 .size(Size::relative(0.18).at_least(110.))
                 .vertical(|mut strip| {
-                    strip.cell(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.allocate_space(Vec2::new(8., 0.));
-                            ui.style_mut().visuals.selection.bg_fill = Color32::from_gray(50);
-                            ui.style_mut().visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
-                            ui.style_mut().visuals.widgets.inactive.weak_bg_fill =
-                                Color32::TRANSPARENT;
-                            ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-                            ui.style_mut().spacing.button_padding = egui::vec2(16.0, 3.0);
-
-                            for (d, s, hotkey) in [
-                                (CurrentColorsDiscriminants::Oklrch, "OKLrCH", Key::F1),
-                                (CurrentColorsDiscriminants::Okhsv, "OKHSV", Key::F2),
-                            ] {
-                                let is_current = self.colors.discriminant() == d;
-                                let text = make_label(ui, s, Some(18.0));
-                                let clicked = Button::selectable(is_current, text)
-                                    .frame_when_inactive(true)
-                                    .ui(ui)
-                                    .clicked();
-                                if clicked || self.hotkey(ui, hotkey) {
-                                    self.colors.convert(d);
-                                }
-                            }
-                        });
-                    });
                     strip.strip(|builder| {
                         self.update_pickers(builder);
                     });
@@ -1405,6 +1631,7 @@ impl eframe::App for App {
             "app_data",
             &AppData {
                 mode: self.colors.discriminant(),
+                favorites: self.favorites.clone(),
             },
         );
     }

@@ -22,12 +22,18 @@ Try the web demo: https://oklch.eerolehtinen.fi/
   - Hex literal (`0xRRGGBB`, `0xAARRGGBB`)
   - Any list of 3 or 4 numbers can be used as a color (e.g. `0.5, 0.5, 0.5` or `120, 120, 120, 255`)
 - Hardware accelerated for maximum smoothness and high resolutions
+- Picks a color directly from the screen on Wayland through
+  [hyprpicker](https://github.com/hyprwm/hyprpicker)
+- Saves favorite colors between sessions
 
 **Wide-gamut displays:** Colors are picked and shown within the sRGB gamut. OKLCH colors outside it are gamut mapped and marked as fallbacks. On wide-gamut displays, such as [Display P3](https://en.wikipedia.org/wiki/DCI-P3), correct colors rely on system color management, which is available on macOS, on Windows with HDR or Auto Color Management on, and on Wayland compositors with color management, e.g. KDE Plasma 6. Elsewhere, such as on X11, colors can look more vivid than intended.
 
 ## Installation
 
 Download from [Releases](https://github.com/eero-lehtinen/oklch-color-picker/releases).
+
+Screen picking on Wayland requires `hyprpicker` to be installed and available in
+`PATH`.
 
 If you have **cargo**, you can also install with:
 
