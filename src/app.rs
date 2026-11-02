@@ -502,14 +502,30 @@ pub struct App {
     active_tab: AppTab,
     favorites: Vec<[f32; 4]>,
     screen_picker_status: Option<String>,
+    contrast_foreground: [f32; 4],
+    contrast_background: [f32; 4],
+    contrast_foreground_text: String,
+    contrast_background_text: String,
     #[cfg(not(target_arch = "wasm32"))]
     screen_picker_receiver: Option<Receiver<Result<Color, String>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    screen_picker_target: ScreenPickerTarget,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, Default)]
+enum ScreenPickerTarget {
+    #[default]
+    Main,
+    ContrastForeground,
+    ContrastBackground,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum AppTab {
     #[default]
     Picker,
+    Contrast,
     Saved,
 }
 
@@ -532,6 +548,8 @@ impl App {
         log_startup::log("Gl programs created");
 
         let AppData { mode, favorites } = Self::load(cc.storage);
+        let initial_contrast: LinearRgba = data.0.into();
+        let initial_contrast = initial_contrast.to_f32_array();
 
         Self {
             colors: CurrentColors::new(mode, data.0),
@@ -556,8 +574,18 @@ impl App {
             active_tab: AppTab::Picker,
             favorites,
             screen_picker_status: None,
+            contrast_foreground: initial_contrast,
+            contrast_background: [1.0, 1.0, 1.0, 1.0],
+            contrast_foreground_text: format_color(
+                LinearRgba::from_f32_array(initial_contrast),
+                ColorFormat::Hex,
+                true,
+            ),
+            contrast_background_text: "#fff".to_owned(),
             #[cfg(not(target_arch = "wasm32"))]
             screen_picker_receiver: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            screen_picker_target: ScreenPickerTarget::Main,
         }
     }
 
@@ -626,7 +654,7 @@ impl App {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn start_screen_picker(&mut self, ctx: &egui::Context) {
+    fn start_screen_picker(&mut self, ctx: &egui::Context, target: ScreenPickerTarget) {
         if self.screen_picker_receiver.is_some() {
             return;
         }
@@ -639,6 +667,7 @@ impl App {
         let (sender, receiver) = mpsc::channel();
         let repaint = ctx.clone();
         self.screen_picker_receiver = Some(receiver);
+        self.screen_picker_target = target;
         self.screen_picker_status = Some("Pick a pixel on the screen…".to_owned());
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
 
@@ -679,7 +708,20 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 match result {
                     Ok(color) => {
-                        self.select_color(color.into());
+                        let color: LinearRgba = color.into();
+                        match self.screen_picker_target {
+                            ScreenPickerTarget::Main => self.select_color(color),
+                            ScreenPickerTarget::ContrastForeground => {
+                                self.contrast_foreground = color.to_f32_array();
+                                self.contrast_foreground_text =
+                                    format_color(color, ColorFormat::Hex, true);
+                            }
+                            ScreenPickerTarget::ContrastBackground => {
+                                self.contrast_background = color.to_f32_array();
+                                self.contrast_background_text =
+                                    format_color(color, ColorFormat::Hex, true);
+                            }
+                        }
                         self.screen_picker_status = Some("Screen color selected.".to_owned());
                     }
                     Err(error) => self.screen_picker_status = Some(error),
@@ -740,6 +782,171 @@ impl App {
         if let Some(index) = remove {
             self.favorites.remove(index);
         }
+    }
+
+    fn contrast_colors(&self) -> (LinearRgba, LinearRgba) {
+        let foreground = LinearRgba::from_f32_array(self.contrast_foreground);
+        let background = LinearRgba::from_f32_array(self.contrast_background);
+        let white = LinearRgba::WHITE;
+
+        let composite = |front: LinearRgba, back: LinearRgba| {
+            let alpha = front.alpha + back.alpha * (1.0 - front.alpha);
+            if alpha <= 0.0 {
+                return LinearRgba::BLACK;
+            }
+            LinearRgba::new(
+                (front.red * front.alpha + back.red * back.alpha * (1.0 - front.alpha)) / alpha,
+                (front.green * front.alpha + back.green * back.alpha * (1.0 - front.alpha)) / alpha,
+                (front.blue * front.alpha + back.blue * back.alpha * (1.0 - front.alpha)) / alpha,
+                alpha,
+            )
+        };
+
+        let background = composite(background, white);
+        (composite(foreground, background), background)
+    }
+
+    fn contrast_ratio(&self) -> f32 {
+        let (foreground, background) = self.contrast_colors();
+        let luminance =
+            |color: LinearRgba| 0.2126 * color.red + 0.7152 * color.green + 0.0722 * color.blue;
+        let foreground = luminance(foreground);
+        let background = luminance(background);
+        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    }
+
+    fn update_contrast_checker(&mut self, ui: &mut egui::Ui) {
+        let parse_hex = |text: &str| {
+            parse_color(text, ColorFormat::Hex).map(|(color, _)| LinearRgba::from(color))
+        };
+        if let Some(color) = parse_hex(&self.contrast_foreground_text) {
+            self.contrast_foreground = color.to_f32_array();
+        }
+        if let Some(color) = parse_hex(&self.contrast_background_text) {
+            self.contrast_background = color.to_f32_array();
+        }
+
+        ui.horizontal(|ui| {
+            ui.heading("Contrast checker");
+            if ui.button("⇄ Swap").clicked() {
+                std::mem::swap(&mut self.contrast_foreground, &mut self.contrast_background);
+                std::mem::swap(
+                    &mut self.contrast_foreground_text,
+                    &mut self.contrast_background_text,
+                );
+            }
+        });
+        ui.label("Check text and background colors against WCAG contrast requirements.");
+        ui.add_space(10.0);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut screen_picker_target = None;
+        ui.columns(2, |columns| {
+            for (column, foreground) in columns.iter_mut().zip([true, false]) {
+                let (label, text, color) = if foreground {
+                    (
+                        "Text color",
+                        &mut self.contrast_foreground_text,
+                        &mut self.contrast_foreground,
+                    )
+                } else {
+                    (
+                        "Background color",
+                        &mut self.contrast_background_text,
+                        &mut self.contrast_background,
+                    )
+                };
+                column.strong(label);
+                column.horizontal(|ui| {
+                    let rgba = LinearRgba::from_f32_array(*color);
+                    let [r, g, b, a] = Srgba::from(rgba).to_u8_array();
+                    let mut picker_color = Color32::from_rgba_unmultiplied(r, g, b, a);
+                    if ui
+                        .color_edit_button_srgba(&mut picker_color)
+                        .on_hover_text("Open color wheel")
+                        .changed()
+                    {
+                        let [r, g, b, a] = picker_color.to_array();
+                        let linear: LinearRgba = Srgba::rgba_u8(r, g, b, a).into();
+                        *color = linear.to_f32_array();
+                        *text = format_color(linear, ColorFormat::Hex, true);
+                    }
+                    ui.add(egui::TextEdit::singleline(text).desired_width(90.0));
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if ui
+                        .add(Button::image(egui::include_image!("eyedropper.svg")))
+                        .on_hover_text("Pick from screen with hyprpicker")
+                        .clicked()
+                    {
+                        screen_picker_target = Some(if foreground {
+                            ScreenPickerTarget::ContrastForeground
+                        } else {
+                            ScreenPickerTarget::ContrastBackground
+                        });
+                    }
+                });
+                if column.button("Use current color").clicked() {
+                    *color = self.fallbacks.cur.to_f32_array();
+                    *text = format_color(self.fallbacks.cur, ColorFormat::Hex, true);
+                }
+            }
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(target) = screen_picker_target {
+            self.start_screen_picker(ui.ctx(), target);
+        }
+
+        ui.add_space(10.0);
+        let ratio = self.contrast_ratio();
+        ui.label(RichText::new(format!("{ratio:.2}:1")).size(30.0).strong());
+
+        let result = |ui: &mut Ui, label: &str, threshold: f32| {
+            let passes = ratio >= threshold;
+            ui.label(label);
+            ui.colored_label(
+                if passes {
+                    Color32::from_rgb(94, 190, 120)
+                } else {
+                    Color32::from_rgb(224, 94, 105)
+                },
+                if passes { "✓ Pass" } else { "✕ Fail" },
+            );
+        };
+        egui::Grid::new("contrast_results")
+            .num_columns(2)
+            .spacing([24.0, 6.0])
+            .show(ui, |ui| {
+                result(ui, "AA · Normal text", 4.5);
+                ui.end_row();
+                result(ui, "AA · Large text / UI", 3.0);
+                ui.end_row();
+                result(ui, "AAA · Normal text", 7.0);
+                ui.end_row();
+                result(ui, "AAA · Large text", 4.5);
+                ui.end_row();
+            });
+
+        ui.add_space(10.0);
+        let (foreground, background) = self.contrast_colors();
+        let foreground = Srgba::from(foreground).to_u8_array();
+        let background = Srgba::from(background).to_u8_array();
+        egui::Frame::new()
+            .fill(Color32::from_rgb(
+                background[0],
+                background[1],
+                background[2],
+            ))
+            .inner_margin(16.0)
+            .corner_radius(6.0)
+            .show(ui, |ui| {
+                ui.visuals_mut().override_text_color = Some(Color32::from_rgb(
+                    foreground[0],
+                    foreground[1],
+                    foreground[2],
+                ));
+                ui.heading("The quick brown fox jumps over the lazy dog.");
+                ui.label("Use this preview to check normal and large text readability.");
+            });
     }
 
     fn glow_paint(&self, ui: &mut egui::Ui, program: ProgramKind, size: Vec2) {
@@ -1150,7 +1357,7 @@ impl App {
                     )
                     .on_hover_text("Pick a color from the screen");
                 if pick.clicked() {
-                    self.start_screen_picker(ui.ctx());
+                    self.start_screen_picker(ui.ctx(), ScreenPickerTarget::Main);
                 }
             }
 
@@ -1197,7 +1404,7 @@ impl App {
                         ("d", "Done (print result to console)"),
                         ("←/↓/↑/→", "Move focus or control input"),
                         ("h/j/k/l", "Move focus or control input (Vim style)"),
-                        ("F1/F2/F3", "Switch color model or favorites tabs"),
+                        ("F1/F2/F3/F4", "Switch color model, contrast, or favorites tabs"),
                         ("1/2", "Switch focus to pickers"),
                         ("3/4/5/6", "Switch focus to sliders"),
                         ("Tab/S-Tab", "Cycle focus"),
@@ -1530,6 +1737,17 @@ impl eframe::App for App {
                     }
                 }
 
+                let contrast_clicked = Button::selectable(
+                    self.active_tab == AppTab::Contrast,
+                    RichText::new("Contrast").size(18.0),
+                )
+                .frame_when_inactive(true)
+                .ui(ui)
+                .clicked();
+                if contrast_clicked || self.hotkey(ui, Key::F3) {
+                    self.active_tab = AppTab::Contrast;
+                }
+
                 let favorite_clicked = Button::selectable(
                     self.active_tab == AppTab::Saved,
                     RichText::new("Favorite").size(18.0),
@@ -1537,12 +1755,16 @@ impl eframe::App for App {
                 .frame_when_inactive(true)
                 .ui(ui)
                 .clicked();
-                if favorite_clicked || self.hotkey(ui, Key::F3) {
+                if favorite_clicked || self.hotkey(ui, Key::F4) {
                     self.active_tab = AppTab::Saved;
                 }
             });
             ui.add_space(6.0);
 
+            if self.active_tab == AppTab::Contrast {
+                self.update_contrast_checker(ui);
+                return;
+            }
             if self.active_tab == AppTab::Saved {
                 self.update_saved_colors(ui);
                 return;
